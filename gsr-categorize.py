@@ -457,18 +457,49 @@ def kde_restore_data(app_id, title, size=(0, 0)):
     return out
 
 
-def create_portal_token(app_id, title, size):
+def set_portal_entry(token_file, app_id, title, size):
+    """Point the game's portal token at a window app id (KDE matches the app id only).
+
+    Reuses the token in token_file, so gsr's own reconnects pick up the change; KDE
+    deletes an entry when a restore fails, Set recreates it under the same token.
+    """
     import string
     import secrets
     from gi.repository import Gio, GLib
-    # Same shape as the portal's own tokens: 22 alphanumeric chars ("-" is rejected)
-    token = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(22))
+    token = token_file.read_text().strip() if token_file.exists() else ""
+    if not token:
+        # Same shape as the portal's own tokens: 22 alphanumeric chars ("-" is rejected)
+        token = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(22))
     data = GLib.Variant("(suv)", ("KDE", 1, GLib.Variant("ay", kde_restore_data(app_id, title, size))))
     Gio.bus_get_sync(Gio.BusType.SESSION).call_sync(
         *PERMISSION_STORE, "Set",
         GLib.Variant("(sbsa{sas}v)", ("screencast", True, token, {"": ["yes"]}, data)),
         None, Gio.DBusCallFlags.NONE, 3000)
-    return token
+    token_file.write_text(token)
+
+
+PORTAL_DIALOG_APP = "org.freedesktop.impl.portal.desktop.kde"
+
+
+def kwin_close_portal_dialog():
+    """Cancel KDE's "share screen" dialog (gsr then reconnects with a fixed entry)."""
+    qdbus = shutil.which("qdbus6") or shutil.which("qdbus")
+    if not qdbus:
+        return
+    name = f"gsr-categories-close-{time.time_ns()}"
+    path = GAME_STATE.with_name(f"{name}.js")
+    path.write_text("workspace.windowList()"
+                    f'.filter(w => (w.desktopFileName || w.resourceClass) == "{PORTAL_DIALOG_APP}")'
+                    ".forEach(w => w.closeWindow());\n")
+    try:
+        run = lambda *a: subprocess.run([qdbus, "org.kde.KWin", *a], capture_output=True, text=True,
+                                        timeout=3).stdout.strip()
+        sid = run("/Scripting", "org.kde.kwin.Scripting.loadScript", str(path), name)
+        if sid.lstrip("-").isdigit() and int(sid) >= 0:
+            run(f"/Scripting/Script{sid}", "org.kde.kwin.Script.run")
+        run("/Scripting", "org.kde.kwin.Scripting.unloadScript", name)
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def replay_running():
@@ -491,7 +522,15 @@ def restart_replay(notify_text):
         if not replay_running():
             break
         time.sleep(0.1)
-    subprocess.run(["gsr-ui-cli", "start-replay"], capture_output=True, timeout=5)
+    # gsr-ui drops a command sent right after another one, so space them and check
+    for _ in range(3):
+        time.sleep(0.3)
+        subprocess.run(["gsr-ui-cli", "start-replay"], capture_output=True, timeout=5)
+        for _ in range(10):
+            time.sleep(0.1)
+            if replay_running():
+                return
+    log("replay did not start again")
 
 
 class Watcher:
@@ -504,7 +543,13 @@ class Watcher:
     def __init__(self):
         self.cache = {}
         self.windows = None  # {pid: (app id, title)}, None until KWin reported once
+        self.window_list = []  # [(pid, app id, title)], newest last
         self.screen_size = (0, 0)
+        # Portal entry tracking: which app id the game's token points at
+        self.target_app = None
+        self.game_apps = set()
+        self.windows_changed = 0.0  # last time the game's windows changed
+        self.dialog_handled = 0.0
         self.window_lost = None  # when the current game's window disappeared
         self.current = GAME_STATE.read_text().strip() if GAME_STATE.exists() else None
         self.resume = replay_running()  # replay was on when the game started
@@ -539,6 +584,8 @@ class Watcher:
                     want = self.current
         if want == self.current:
             self.since = None
+            if self.current and self.windows is not None:
+                self.track_portal(games, now)
             return
         self.since = self.since or now
         if now - self.since >= delay:
@@ -548,15 +595,62 @@ class Watcher:
     def running(self, cfg):
         return running_games(cfg, self.cache) if cfg.get("game_mode", True) else {}
 
+    def game_windows(self, games):
+        """[(app id, title)] of the current game's windows (own or its gamescope), newest last."""
+        pids = {pid for pid, name in games.items() if name == self.current}
+        for pid in list(pids):
+            p = pid
+            for _ in range(30):
+                p = proc_parent(p)
+                if not p or p <= 1:
+                    break
+                if is_gamescope(p):
+                    pids.add(p)
+        return [(app, title) for pid, app, title in self.window_list if pid in pids and app]
+
+    def track_portal(self, games, now):
+        """Keep the portal entry on the game's current window.
+
+        Launchers, updaters and splash screens are separate windows, often with another
+        app id. gsr reconnects by itself when its window closes, so the entry has to
+        point at the next window before that happens.
+        """
+        wins = self.game_windows(games)
+        apps = {app for app, _ in wins}
+        new = [w for w in wins if w[0] not in self.game_apps]
+        if apps != self.game_apps:
+            self.windows_changed = now
+        self.game_apps = apps
+        if new:
+            target = new[-1]
+        elif self.target_app in apps:
+            target = None
+        else:
+            target = wins[-1] if wins else None
+        if target and target[0] != self.target_app:
+            self.point_portal(target)
+
+        # The dialog showed up anyway (e.g. the window changed too fast): fix the entry,
+        # cancel the dialog and reconnect. Only right after the game's windows changed,
+        # so a screen share you start yourself (Discord etc.) is left alone.
+        dialog = any(app == PORTAL_DIALOG_APP for _, app, _ in self.window_list)
+        if dialog and wins and now - self.windows_changed < 10 and now - self.dialog_handled > 5:
+            self.dialog_handled = now
+            self.point_portal(wins[-1])
+            log(f"portal dialog for {self.current!r}: cancelled it, reconnecting to {wins[-1]!r}")
+            kwin_close_portal_dialog()
+            restart_replay(f"Switching to Gamerecording. Game: {self.current}")
+
+    def point_portal(self, window):
+        try:
+            set_portal_entry(portal_token_path(self.current), *window, self.screen_size)
+            self.target_app = window[0]
+            log(f"portal permission for {self.current!r} -> window {window!r}")
+        except Exception as e:  # KDE will ask instead
+            log(f"could not set portal permission: {e!r}")
+
     def switch(self, game, window=None):
         was_running = replay_running()
-        token = portal_token_path(game)
-        if game and window and not token.exists():
-            try:
-                token.write_text(create_portal_token(*window, self.screen_size))
-                log(f"created portal permission for window {window!r}")
-            except Exception as e:  # KDE will ask instead
-                log(f"could not create portal permission: {e!r}")
         if game and self.current is None:
             self.resume = was_running
         if game:
@@ -566,6 +660,11 @@ class Watcher:
             GAME_STATE.unlink(missing_ok=True)
         log(f"game mode: {self.current!r} -> {game!r} (replay running: {was_running})")
         self.current = game
+        self.target_app, self.game_apps = None, set()
+        self.windows_changed = time.monotonic()
+        if game and window:
+            self.game_apps = {window[0]}
+            self.point_portal(window)
         if was_running or (game is None and self.resume):
             restart_replay(f"Switching to Gamerecording. Game: {game}" if game
                            else "Switching to Desktop recording")
@@ -573,7 +672,8 @@ class Watcher:
     def on_windows(self, payload):
         try:
             data = json.loads(payload)
-            self.windows = {int(pid): (app, title) for pid, app, title in data["windows"]}
+            self.window_list = [(int(pid), app, title) for pid, app, title in data["windows"]]
+            self.windows = {pid: (app, title) for pid, app, title in self.window_list}
             self.screen_size = tuple(int(v) for v in data["size"])
         except (ValueError, TypeError, KeyError):
             return

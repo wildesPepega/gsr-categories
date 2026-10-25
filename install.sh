@@ -126,7 +126,7 @@ case ":$PATH:" in
 esac
 
 # --- notifications --------------------------------------------------------------
-# While the watcher switches modes, hide gsr-ui's "Replay stopped" and replace its
+# While the watcher switches modes, hide gsr-ui's other messages (except saving) and replace its
 # "Started replaying ..." with the text the watcher left in $note
 if [ -x /usr/bin/gsr-notify ]; then
   cat > "$notify" <<EOF
@@ -140,7 +140,7 @@ if [ -f "$note" ] && [ $(( $(date +%s) - $(stat -c %Y "$note") )) -le 8 ]; then
   text=""; prev=""
   for a do [ "$prev" = --text ] && text=$a; prev=$a; done
   case "$text" in
-    *[Ss]topped*) exit 0 ;;
+    *[Ss]av*) ;;
     *[Ss]tarted*)
       msg=$(cat "$note"); rm -f "$note"
       first=1; repl=0
@@ -150,6 +150,7 @@ if [ -f "$note" ] && [ $(( $(date +%s) - $(stat -c %Y "$note") )) -le 8 ]; then
         [ "$a" = --text ] && repl=1
         set -- "$@" "$a"
       done ;;
+    *) exit 0 ;;  # "Replay stopped", errors from a cancelled portal dialog, ...
   esac
 fi
 exec "$real" "$@"

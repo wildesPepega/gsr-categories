@@ -65,6 +65,10 @@ On Wayland, a single window can only be captured through the desktop portal, whi
 
 This relies on an internal KDE format, tested with Plasma 6.8. If it changes, KDE just shows the dialog again: pick the game window once and the choice is remembered. Uninstalling removes the entries again.
 
+KDE matches the saved window by app id only. Launchers, updaters and splash screens are often separate windows with a different app id. For example, a non-Steam shortcut's launcher is `steam_app_4113168626`, while the game it starts is `steam_app_3354750`. gsr reconnects by itself when its window closes, so the watcher keeps the entry pointed at the game's newest window. When a new window of the game appears, the entry moves to it before the old one closes.
+
+If the dialog still shows up right after the game's windows changed, the watcher fixes the entry, cancels the dialog and restarts the replay. Dialogs at other times, such as a screen share you start in Discord, are left alone.
+
 If a game has a launcher, for example Rockstar's, game mode stays on for up to 20 seconds after the launcher window closes, so it doesn't flip back and forth before the game window opens.
 
 Tip for CS2: put `engine_no_focus_sleep 0` in your autoexec. Otherwise the game throttles its FPS while unfocused and the background part of the clip stutters.
