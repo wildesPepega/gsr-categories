@@ -59,9 +59,13 @@ The installer also turns off gsr-ui's own "name after application" and "organize
 
 Names keep their official spelling. Only characters that break folder names (`: / \ * ? " < > |`) and `™ ® ©` are removed.
 
-### Game mode and the portal dialog
+### Game mode without the "share screen" dialog
 
-On Wayland, a single window can only be captured through the desktop portal. The first time game mode starts for a game, KDE asks you to pick the window. Choose the game, or the gamescope window if you use gamescope. The choice is saved per game in `~/.config/gsr-categories/portal-tokens/` and restored automatically next time, even after the game restarts.
+On Wayland, a single window can only be captured through the desktop portal, which normally asks you to pick the window. KDE saves such a choice as the window's app id and title in the portal permission store. For example, a Proton game is `steam_app_3240220` and a game running in gamescope is `gamescope`. Before the first switch for a game, the watcher writes that entry itself, so KDE restores the game window without asking. The token is kept per game in `~/.config/gsr-categories/portal-tokens/`.
+
+This relies on an internal KDE format, tested with Plasma 6.8. If it changes, KDE just shows the dialog again: pick the game window once and the choice is remembered. Uninstalling removes the entries again.
+
+If a game has a launcher, for example Rockstar's, game mode stays on for up to 20 seconds after the launcher window closes, so it doesn't flip back and forth before the game window opens.
 
 Tip for CS2: put `engine_no_focus_sleep 0` in your autoexec. Otherwise the game throttles its FPS while unfocused and the background part of the clip stutters.
 

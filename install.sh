@@ -31,6 +31,13 @@ uninstall() {
   fi
   [ -f "$notify" ] && grep -q "$marker" "$notify" && rm -f "$notify"
   rm -f "$script"
+  # Screen-share permissions created for game mode
+  for t in "$HOME"/.config/gsr-categories/portal-tokens/*.token; do
+    [ -f "$t" ] || continue
+    busctl --user call org.freedesktop.impl.portal.PermissionStore /org/freedesktop/impl/portal/PermissionStore \
+      org.freedesktop.impl.portal.PermissionStore Delete ss screencast "$(cat "$t")" >/dev/null 2>&1 || true
+    rm -f "$t"
+  done
   rm -rf "$share" "${XDG_RUNTIME_DIR:-/tmp}/gsr-categories"
   qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript gsr-categories-windows >/dev/null 2>&1 || true
   say "uninstalled. Your config (~/.config/gsr-categories) and clips were kept."

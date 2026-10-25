@@ -354,11 +354,14 @@ NOTIFY_STATE = GAME_STATE.with_name("notify")
 BUS_NAME = "org.gsrcategories.Watch"
 BUS_PATH = "/org/gsrcategories/Watch"
 KWIN_SCRIPT_NAME = "gsr-categories-windows"
-# Reports the PIDs of all windows to the watcher whenever a window opens/closes
+# Reports all windows (pid, app id, title) to the watcher whenever one opens/closes
 KWIN_SCRIPT = f"""
 function report() {{
-    const pids = workspace.windowList().filter(w => w.normalWindow).map(w => w.pid);
-    callDBus("{BUS_NAME}", "{BUS_PATH}", "{BUS_NAME}", "Windows", pids.join(","));
+    const wins = workspace.windowList().filter(w => w.normalWindow)
+        .map(w => [w.pid, w.desktopFileName || w.resourceClass || "", w.caption || ""]);
+    const size = workspace.virtualScreenSize;
+    callDBus("{BUS_NAME}", "{BUS_PATH}", "{BUS_NAME}", "Windows",
+             JSON.stringify({{size: [size.width, size.height], windows: wins}}));
 }}
 workspace.windowAdded.connect(report);
 workspace.windowRemoved.connect(report);
@@ -367,7 +370,7 @@ report();
 BUS_XML = f"""
 <node>
   <interface name="{BUS_NAME}">
-    <method name="Windows"><arg type="s" name="pids" direction="in"/></method>
+    <method name="Windows"><arg type="s" name="windows" direction="in"/></method>
   </interface>
 </node>
 """
@@ -405,19 +408,67 @@ def is_gamescope(pid):
         return False
 
 
-def game_with_window(games, window_pids):
-    """Name of a game that has a window: its own, or the gamescope window it runs in."""
+def game_with_window(games, windows):
+    """(game name, window pid) of a game that has a window: its own, or the gamescope
+    window it runs in. (None, None) if no game has one."""
     for pid, name in games.items():
-        if pid in window_pids:
-            return name
+        if pid in windows:
+            return name, pid
         p = pid
         for _ in range(30):
             p = proc_parent(p)
             if not p or p <= 1:
                 break
-            if p in window_pids and is_gamescope(p):
-                return name
-    return None
+            if p in windows and is_gamescope(p):
+                return name, p
+    return None, None
+
+
+# --- portal permission ----------------------------------------------------------
+# KDE remembers a screen-share choice as (window app id, window title) in the portal
+# permission store. Writing that entry ourselves before the first switch means KDE
+# never shows the "share screen" dialog. If the format ever changes, KDE just asks.
+
+PERMISSION_STORE = ("org.freedesktop.impl.portal.PermissionStore",
+                    "/org/freedesktop/impl/portal/PermissionStore",
+                    "org.freedesktop.impl.portal.PermissionStore")
+
+
+def portal_token_path(game):
+    tokens = CONFIG_PATH.parent / "portal-tokens"
+    tokens.mkdir(parents=True, exist_ok=True)
+    return tokens / f"{game or 'default'}.token"
+
+
+def _qstring(text):
+    raw = text.encode("utf-16-be")
+    return struct.pack(">I", len(raw)) + raw
+
+
+def kde_restore_data(app_id, title, size=(0, 0)):
+    """QDataStream'd QVariantMap that xdg-desktop-portal-kde stores for a window share."""
+    out = struct.pack(">I", 4)
+    out += _qstring("outputs") + struct.pack(">IBI", 9, 0, 0)                    # QVariantList []
+    out += _qstring("region") + struct.pack(">IBiiii", 19, 0, 0, 0, -1, -1)      # QRect (null)
+    out += _qstring("virtualSize") + struct.pack(">IBii", 21, 0, *size)          # QSize
+    type_name = b"QList<WindowRestoreInfo>\0"
+    out += _qstring("windows") + struct.pack(">IBI", 0x10000, 0, len(type_name)) + type_name
+    out += struct.pack(">I", 1) + _qstring(app_id) + _qstring(title)
+    return out
+
+
+def create_portal_token(app_id, title, size):
+    import string
+    import secrets
+    from gi.repository import Gio, GLib
+    # Same shape as the portal's own tokens: 22 alphanumeric chars ("-" is rejected)
+    token = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(22))
+    data = GLib.Variant("(suv)", ("KDE", 1, GLib.Variant("ay", kde_restore_data(app_id, title, size))))
+    Gio.bus_get_sync(Gio.BusType.SESSION).call_sync(
+        *PERMISSION_STORE, "Set",
+        GLib.Variant("(sbsa{sas}v)", ("screencast", True, token, {"": ["yes"]}, data)),
+        None, Gio.DBusCallFlags.NONE, 3000)
+    return token
 
 
 def replay_running():
@@ -452,7 +503,9 @@ class Watcher:
 
     def __init__(self):
         self.cache = {}
-        self.window_pids = None  # None until KWin reported once
+        self.windows = None  # {pid: (app id, title)}, None until KWin reported once
+        self.screen_size = (0, 0)
+        self.window_lost = None  # when the current game's window disappeared
         self.current = GAME_STATE.read_text().strip() if GAME_STATE.exists() else None
         self.resume = replay_running()  # replay was on when the game started
         self.since = None  # when the wanted mode first differed from the current one
@@ -467,27 +520,43 @@ class Watcher:
     def _evaluate(self):
         cfg = load_config()
         games = self.running(cfg)
-        if self.window_pids is None:
+        now = time.monotonic()
+        win = None
+        if self.windows is None:
             # No window info from KWin: fall back to "a game process runs for a while"
             want = next(iter(games.values()), None)
             delay = float(cfg.get("game_mode_delay", 8)) if want else 3
         else:
-            want = game_with_window(games, self.window_pids)
+            want, win = game_with_window(games, self.windows)
             delay = 0.5 if want else 1
+            if want or self.current not in games.values():
+                self.window_lost = None
+            else:
+                # Game still runs without a window (launcher closed, game window next):
+                # stay in game mode for a while instead of switching back and forth
+                self.window_lost = self.window_lost or now
+                if now - self.window_lost < 20:
+                    want = self.current
         if want == self.current:
             self.since = None
             return
-        now = time.monotonic()
         self.since = self.since or now
         if now - self.since >= delay:
-            self.switch(want)
+            self.switch(want, self.windows.get(win) if self.windows and win else None)
             self.since = None
 
     def running(self, cfg):
         return running_games(cfg, self.cache) if cfg.get("game_mode", True) else {}
 
-    def switch(self, game):
+    def switch(self, game, window=None):
         was_running = replay_running()
+        token = portal_token_path(game)
+        if game and window and not token.exists():
+            try:
+                token.write_text(create_portal_token(*window, self.screen_size))
+                log(f"created portal permission for window {window!r}")
+            except Exception as e:  # KDE will ask instead
+                log(f"could not create portal permission: {e!r}")
         if game and self.current is None:
             self.resume = was_running
         if game:
@@ -501,8 +570,13 @@ class Watcher:
             restart_replay(f"Switching to Gamerecording. Game: {game}" if game
                            else "Switching to Desktop recording")
 
-    def on_windows(self, pids):
-        self.window_pids = {int(p) for p in pids.split(",") if p.isdigit()}
+    def on_windows(self, payload):
+        try:
+            data = json.loads(payload)
+            self.windows = {int(pid): (app, title) for pid, app, title in data["windows"]}
+            self.screen_size = tuple(int(v) for v in data["size"])
+        except (ValueError, TypeError, KeyError):
+            return
         self.evaluate()
 
 
@@ -554,7 +628,7 @@ def watch():
         # KWin restarts (e.g. crash) drop the script; reload it
         try:
             if not kwin_script_loaded():
-                w.window_pids = None
+                w.windows = None
                 kwin_load_script()
         except (OSError, subprocess.SubprocessError):
             pass
@@ -572,10 +646,7 @@ def main():
         return watch()
     if len(sys.argv) > 1 and sys.argv[1] == "--portal-token":
         # Per-game portal token, so each game remembers its own window choice
-        game = GAME_STATE.read_text().strip() if GAME_STATE.exists() else "default"
-        tokens = CONFIG_PATH.parent / "portal-tokens"
-        tokens.mkdir(parents=True, exist_ok=True)
-        print(tokens / f"{game}.token")
+        print(portal_token_path(GAME_STATE.read_text().strip() if GAME_STATE.exists() else None))
         return 0
     if len(sys.argv) < 2:
         print(__doc__)
